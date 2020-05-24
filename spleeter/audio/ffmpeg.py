@@ -16,7 +16,8 @@ import numpy as np
 # pylint: enable=import-error
 
 from .adapter import AudioAdapter
-from ..logging import get_logger
+from .. import SpleeterError
+from ..utils.logging import get_logger
 
 __email__ = 'research@deezer.com'
 __author__ = 'Deezer Research'
@@ -31,6 +32,15 @@ def _to_ffmpeg_time(n):
     m, s = divmod(n, 60)
     h, m = divmod(m, 60)
     return '%d:%02d:%09.6f' % (h, m, s)
+
+
+def _to_ffmpeg_codec(codec):
+    ffmpeg_codecs = {
+        'm4a': 'aac',
+        'ogg': 'libvorbis',
+        'wma': 'wmav2',
+    }
+    return ffmpeg_codecs.get(codec) or codec
 
 
 class FFMPEGProcessAudioAdapter(AudioAdapter):
@@ -54,12 +64,18 @@ class FFMPEGProcessAudioAdapter(AudioAdapter):
         :param sample_rate: (Optional) Sample rate to load audio with.
         :param dtype: (Optional) Numpy data type to use, default to float32.
         :returns: Loaded data a (waveform, sample_rate) tuple.
+        :raise SpleeterError: If any error occurs while loading audio.
         """
         if not isinstance(path, str):
             path = path.decode()
-        probe = ffmpeg.probe(path)
+        try:
+            probe = ffmpeg.probe(path)
+        except ffmpeg._run.Error as e:
+            raise SpleeterError(
+                'An error occurs with ffprobe (see ffprobe output below)\n\n{}'
+                .format(e.stderr.decode()))
         if 'streams' not in probe or len(probe['streams']) == 0:
-            raise IOError('No stream was found with ffprobe')
+            raise SpleeterError('No stream was found with ffprobe')
         metadata = next(
             stream
             for stream in probe['streams']
@@ -96,26 +112,26 @@ class FFMPEGProcessAudioAdapter(AudioAdapter):
         :param bitrate: (Optional) Bitrate of the written audio file.
         :raise IOError: If any error occurs while using FFMPEG to write data.
         """
-        directory = os.path.split(path)[0]
+        directory = os.path.dirname(path)
         if not os.path.exists(directory):
-            os.makedirs(directory)
+            raise SpleeterError(f'output directory does not exists: {directory}')
         get_logger().debug('Writing file %s', path)
         input_kwargs = {'ar': sample_rate, 'ac': data.shape[1]}
         output_kwargs = {'ar': sample_rate, 'strict': '-2'}
         if bitrate:
             output_kwargs['audio_bitrate'] = bitrate
         if codec is not None and codec != 'wav':
-            output_kwargs['codec'] = codec
+            output_kwargs['codec'] = _to_ffmpeg_codec(codec)
         process = (
             ffmpeg
             .input('pipe:', format='f32le', **input_kwargs)
             .output(path, **output_kwargs)
             .overwrite_output()
-            .run_async(pipe_stdin=True, quiet=True))
+            .run_async(pipe_stdin=True, pipe_stderr=True, quiet=True))
         try:
             process.stdin.write(data.astype('<f4').tobytes())
             process.stdin.close()
             process.wait()
         except IOError:
-            raise IOError(f'FFMPEG error: {process.stderr.read()}')
-        get_logger().info('File %s written', path)
+            raise SpleeterError(f'FFMPEG error: {process.stderr.read()}')
+        get_logger().info('File %s written succesfully', path)
